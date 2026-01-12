@@ -10,73 +10,105 @@ function App() {
   const [transcripts, setTranscripts] = useState([])
   const [status, setStatus] = useState('Click to start')
   const [isSpeaking, setIsSpeaking] = useState(false)
+  const [goAwayWarning, setGoAwayWarning] = useState(null)
   
   const transcriptsRef = useRef(null)
   const isConnectedRef = useRef(false)
+  const currentUserTranscriptRef = useRef('')
+  const currentAssistantTranscriptRef = useRef('')
 
-  const { sendAudio, connect, disconnect } = useWebSocket({
+  const { playAudio, stopPlayback } = useAudioPlayer({
+    onEnded: () => setIsSpeaking(false)
+  })
+
+  const { sendAudio, connect, disconnect, sendInterrupt } = useWebSocket({
     url: 'ws://localhost:8080',
     onConnected: () => {
       setIsConnected(true)
       isConnectedRef.current = true
       setStatus('Connected • Listening...')
-      // Start recording immediately when connected
       startRecording()
     },
-    onDisconnected: () => {
+    onDisconnected: (resumptionToken) => {
       setIsConnected(false)
       isConnectedRef.current = false
       setIsStreaming(false)
-      setStatus('Click to start')
+      setStatus(resumptionToken ? 'Disconnected (can resume)' : 'Disconnected')
       setIsSpeaking(false)
       stopRecording()
+      stopPlayback()
     },
     onAudio: (audioData, mimeType) => {
       setIsSpeaking(true)
       playAudio(audioData, mimeType)
     },
-    onTranscript: (text, isFinal) => {
-      setTranscripts(prev => {
-        const newTranscripts = [...prev]
-        const lastIndex = newTranscripts.length - 1
-        
-        if (lastIndex >= 0 && !newTranscripts[lastIndex].isFinal && newTranscripts[lastIndex].role === 'assistant') {
-          newTranscripts[lastIndex] = { 
-            ...newTranscripts[lastIndex], 
-            text: newTranscripts[lastIndex].text + text,
-            isFinal 
-          }
+    onTranscript: (text, isFinal, role) => {
+      if (role === 'user') {
+        // User transcript (what user is saying)
+        if (isFinal) {
+          // Final user transcript - add to transcripts
+          setTranscripts(prev => [
+            ...prev.filter(t => t.id !== 'user-current'),
+            { id: `user-${Date.now()}`, role: 'user', text: text, isFinal: true }
+          ])
+          currentUserTranscriptRef.current = ''
         } else {
-          newTranscripts.push({ role: 'assistant', text, isFinal, timestamp: Date.now() })
+          // Interim user transcript - update current
+          currentUserTranscriptRef.current = text
+          setTranscripts(prev => {
+            const filtered = prev.filter(t => t.id !== 'user-current')
+            return [...filtered, { id: 'user-current', role: 'user', text: text, isFinal: false }]
+          })
         }
-        return newTranscripts
-      })
+      } else {
+        // Assistant transcript (what Gemini is saying)
+        if (isFinal) {
+          // Final assistant transcript
+          setTranscripts(prev => [
+            ...prev.filter(t => t.id !== 'assistant-current'),
+            { id: `assistant-${Date.now()}`, role: 'assistant', text: text, isFinal: true }
+          ])
+          currentAssistantTranscriptRef.current = ''
+        } else {
+          // Interim assistant transcript - accumulate
+          currentAssistantTranscriptRef.current += text
+          setTranscripts(prev => {
+            const filtered = prev.filter(t => t.id !== 'assistant-current')
+            return [...filtered, { id: 'assistant-current', role: 'assistant', text: currentAssistantTranscriptRef.current, isFinal: false }]
+          })
+        }
+      }
     },
     onTurnComplete: () => {
       setIsSpeaking(false)
+      currentAssistantTranscriptRef.current = ''
     },
     onInterrupted: () => {
       setIsSpeaking(false)
+      stopPlayback()
+      currentAssistantTranscriptRef.current = ''
     },
     onError: (message) => {
       setStatus(`Error: ${message}`)
+    },
+    onGoAway: (info) => {
+      setGoAwayWarning(`Session ending: ${info.reason}. Time left: ${info.timeLeft || 'unknown'}`)
+      setTimeout(() => setGoAwayWarning(null), 10000)
+    },
+    onSessionResumable: (token) => {
+      console.log('Session can be resumed with token')
     }
-  })
-
-  const { playAudio } = useAudioPlayer({
-    onEnded: () => setIsSpeaking(false)
   })
 
   const { startRecording, stopRecording, isSupported } = useAudioRecorder({
     onAudioData: (base64Audio) => {
-      // Always stream when connected
       if (isConnectedRef.current) {
         sendAudio(base64Audio)
       }
     },
     onStarted: () => {
       setIsStreaming(true)
-      setStatus('🎤 Live • Streaming audio...')
+      setStatus('🎤 Live • Streaming...')
     }
   })
 
@@ -89,12 +121,10 @@ function App() {
 
   const handleToggleConnection = useCallback(async () => {
     if (isConnected) {
-      // Disconnect
       stopRecording()
       setIsStreaming(false)
       disconnect()
     } else {
-      // Connect - recording will start automatically in onConnected
       setStatus('Connecting...')
       connect()
     }
@@ -102,6 +132,13 @@ function App() {
 
   const handleClear = () => {
     setTranscripts([])
+    currentUserTranscriptRef.current = ''
+    currentAssistantTranscriptRef.current = ''
+  }
+
+  const handleInterrupt = () => {
+    sendInterrupt()
+    stopPlayback()
   }
 
   return (
@@ -109,6 +146,13 @@ function App() {
       {/* Background Effects */}
       <div className="bg-gradient" />
       <div className="bg-grid" />
+      
+      {/* GoAway Warning */}
+      {goAwayWarning && (
+        <div className="go-away-warning">
+          ⚠️ {goAwayWarning}
+        </div>
+      )}
       
       {/* Header */}
       <header className="header">
@@ -137,11 +181,18 @@ function App() {
         <div className="transcript-panel">
           <div className="panel-header">
             <h2>Conversation</h2>
-            {transcripts.length > 0 && (
-              <button className="clear-btn" onClick={handleClear}>
-                Clear
-              </button>
-            )}
+            <div className="panel-actions">
+              {isSpeaking && (
+                <button className="interrupt-btn" onClick={handleInterrupt}>
+                  Stop
+                </button>
+              )}
+              {transcripts.length > 0 && (
+                <button className="clear-btn" onClick={handleClear}>
+                  Clear
+                </button>
+              )}
+            </div>
           </div>
           
           <div className="transcripts" ref={transcriptsRef}>
@@ -165,13 +216,14 @@ function App() {
                 <span>Start speaking to Gemini</span>
               </div>
             ) : (
-              transcripts.map((item, index) => (
+              transcripts.map((item) => (
                 <div 
-                  key={index} 
-                  className={`transcript-item ${item.role} animate-fade-in`}
+                  key={item.id} 
+                  className={`transcript-item ${item.role} ${!item.isFinal ? 'interim' : ''} animate-fade-in`}
                 >
                   <div className="transcript-role">
                     {item.role === 'user' ? '👤 You' : '✨ Gemini'}
+                    {!item.isFinal && <span className="typing-indicator">...</span>}
                   </div>
                   <div className="transcript-text">{item.text}</div>
                 </div>

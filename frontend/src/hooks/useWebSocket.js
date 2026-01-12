@@ -5,16 +5,18 @@ export function useWebSocket({
   onConnected = () => {},
   onDisconnected = () => {},
   onAudio = (data, mimeType) => {},
-  onTranscript = () => {},
+  onTranscript = (text, isFinal, role) => {},
   onTurnComplete = () => {},
   onInterrupted = () => {},
-  onError = () => {}
+  onError = () => {},
+  onGoAway = () => {},
+  onSessionResumable = () => {}
 }) {
   const [connectionState, setConnectionState] = useState('disconnected')
   const wsRef = useRef(null)
-  const reconnectTimeoutRef = useRef(null)
+  const sessionTokenRef = useRef(null)
 
-  const connect = useCallback(() => {
+  const connect = useCallback((resumptionToken = null) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       return
     }
@@ -26,7 +28,15 @@ export function useWebSocket({
 
       wsRef.current.onopen = () => {
         setConnectionState('connected')
-        console.log('WebSocket connected')
+        console.log('WebSocket connected to server')
+        
+        // If we have a resumption token, send it
+        if (resumptionToken) {
+          wsRef.current.send(JSON.stringify({
+            type: 'resume',
+            token: resumptionToken
+          }))
+        }
       }
 
       wsRef.current.onmessage = (event) => {
@@ -35,27 +45,54 @@ export function useWebSocket({
           
           switch (data.type) {
             case 'connected':
+              console.log('✅ Connected to Gemini')
               onConnected()
               break
+              
             case 'disconnected':
-              onDisconnected()
+              console.log('❌ Disconnected from Gemini')
+              if (data.resumptionToken) {
+                sessionTokenRef.current = data.resumptionToken
+              }
+              onDisconnected(data.resumptionToken)
               break
+              
             case 'audio':
-              console.log(`🎵 Received audio from server: ${data.data.length} bytes, mime: ${data.mimeType}`)
+              console.log(`🎵 Audio: ${data.data.length} chars, ${data.mimeType}`)
               onAudio(data.data, data.mimeType)
               break
+              
             case 'transcript':
-              onTranscript(data.text, data.isFinal)
+              console.log(`💬 ${data.role}: "${data.text}" (final: ${data.isFinal})`)
+              onTranscript(data.text, data.isFinal, data.role)
               break
+              
             case 'turn_complete':
+              console.log('✅ Turn complete')
               onTurnComplete()
               break
+              
             case 'interrupted':
+              console.log('⚡ Interrupted')
               onInterrupted()
               break
+              
             case 'error':
+              console.error('❌ Error:', data.message)
               onError(data.message)
               break
+              
+            case 'go_away':
+              console.warn('⚠️ Go Away:', data.reason, 'Time left:', data.timeLeft)
+              onGoAway(data)
+              break
+              
+            case 'session_resumable':
+              console.log('📌 Session resumable, token received')
+              sessionTokenRef.current = data.token
+              onSessionResumable(data.token)
+              break
+              
             default:
               console.log('Unknown message type:', data.type)
           }
@@ -67,7 +104,7 @@ export function useWebSocket({
       wsRef.current.onclose = (event) => {
         setConnectionState('disconnected')
         console.log('WebSocket closed:', event.code, event.reason)
-        onDisconnected()
+        onDisconnected(sessionTokenRef.current)
       }
 
       wsRef.current.onerror = (error) => {
@@ -79,14 +116,9 @@ export function useWebSocket({
       setConnectionState('disconnected')
       onError('Failed to connect')
     }
-  }, [url, onConnected, onDisconnected, onAudio, onTranscript, onTurnComplete, onInterrupted, onError])
+  }, [url, onConnected, onDisconnected, onAudio, onTranscript, onTurnComplete, onInterrupted, onError, onGoAway, onSessionResumable])
 
   const disconnect = useCallback(() => {
-    if (reconnectTimeoutRef.current) {
-      clearTimeout(reconnectTimeoutRef.current)
-      reconnectTimeoutRef.current = null
-    }
-
     if (wsRef.current) {
       wsRef.current.close()
       wsRef.current = null
@@ -103,6 +135,23 @@ export function useWebSocket({
     }
   }, [])
 
+  const sendText = useCallback((text) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: 'text',
+        text: text
+      }))
+    }
+  }, [])
+
+  const sendInterrupt = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: 'interrupt'
+      }))
+    }
+  }, [])
+
   const sendMessage = useCallback((type, payload = {}) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({
@@ -111,6 +160,15 @@ export function useWebSocket({
       }))
     }
   }, [])
+
+  // Resume session with stored token
+  const resume = useCallback(() => {
+    if (sessionTokenRef.current) {
+      connect(sessionTokenRef.current)
+    } else {
+      connect()
+    }
+  }, [connect])
 
   // Cleanup on unmount
   useEffect(() => {
@@ -122,10 +180,13 @@ export function useWebSocket({
   return {
     connect,
     disconnect,
+    resume,
     sendAudio,
+    sendText,
+    sendInterrupt,
     sendMessage,
     connectionState,
-    isConnected: connectionState === 'connected'
+    isConnected: connectionState === 'connected',
+    sessionToken: sessionTokenRef.current
   }
 }
-

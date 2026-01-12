@@ -6,21 +6,31 @@ const MODEL = 'models/gemini-2.5-flash-native-audio-preview-12-2025';
 export class GeminiLiveClient {
   constructor(options) {
     this.apiKey = options.apiKey;
+    
+    // Callbacks
     this.onAudio = options.onAudio || (() => {});
     this.onTranscript = options.onTranscript || (() => {});
+    this.onInputTranscript = options.onInputTranscript || (() => {});
     this.onInterrupted = options.onInterrupted || (() => {});
     this.onTurnComplete = options.onTurnComplete || (() => {});
     this.onError = options.onError || (() => {});
     this.onConnected = options.onConnected || (() => {});
     this.onDisconnected = options.onDisconnected || (() => {});
+    this.onGoAway = options.onGoAway || (() => {});
+    this.onSessionResumable = options.onSessionResumable || (() => {});
     
     this.ws = null;
     this.isConnected = false;
     this.setupComplete = false;
     
+    // Session management
+    this.sessionResumptionToken = null;
+    this.lastSessionResumptionToken = options.resumptionToken || null;
+    
+    // Configuration
     this.config = {
-      systemInstruction: "You are a helpful AI assistant. Be concise and conversational.",
-      voiceName: "Puck" // Options: Puck, Charon, Kore, Fenrir, Aoede
+      systemInstruction: options.systemInstruction || "You are a helpful and friendly AI assistant. Be concise and conversational.",
+      voiceName: options.voiceName || "Puck" // Options: Puck, Charon, Kore, Fenrir, Aoede
     };
   }
 
@@ -68,12 +78,28 @@ export class GeminiLiveClient {
         },
         systemInstruction: {
           parts: [{ text: this.config.systemInstruction }]
+        },
+        // Enable output audio transcription (what Gemini says as text)
+        outputAudioTranscription: {},
+        // Enable input audio transcription (what user says as text)
+        inputAudioTranscription: {},
+        // Session resumption for handling disconnects
+        sessionResumption: {
+          // If we have a previous token, use it to resume
+          ...(this.lastSessionResumptionToken && { handle: this.lastSessionResumptionToken })
+        },
+        // Context window compression for longer sessions (15min+ for audio)
+        contextWindowCompression: {
+          triggerTokens: 25000,
+          slidingWindow: {
+            targetTokens: 12500
+          }
         }
       }
     };
 
     this.send(setupMessage);
-    console.log('📤 Sent setup message');
+    console.log('📤 Sent setup message with transcription and session resumption enabled');
   }
 
   handleMessage(data) {
@@ -88,23 +114,73 @@ export class GeminiLiveClient {
         return;
       }
 
+      // Handle session resumption update
+      if (message.sessionResumptionUpdate) {
+        const update = message.sessionResumptionUpdate;
+        if (update.newHandle) {
+          this.sessionResumptionToken = update.newHandle;
+          console.log('🔄 Session resumption token updated');
+          this.onSessionResumable(update.newHandle);
+        }
+        if (update.resumable !== undefined) {
+          console.log(`📌 Session resumable: ${update.resumable}`);
+        }
+        return;
+      }
+
+      // Handle goAway message (server requesting graceful disconnect)
+      if (message.goAway) {
+        console.log('⚠️ GoAway received - server requesting disconnect');
+        console.log(`   Time left: ${message.goAway.timeLeft || 'unknown'}`);
+        this.onGoAway({
+          timeLeft: message.goAway.timeLeft,
+          reason: message.goAway.reason || 'Server requested disconnect'
+        });
+        return;
+      }
+
       // Handle server content (audio/text responses)
       if (message.serverContent) {
         const content = message.serverContent;
         
+        // Check if generation is complete
+        if (content.generationComplete) {
+          console.log('🏁 Generation complete');
+          this.onTurnComplete();
+          return;
+        }
+
         // Check if interrupted
         if (content.interrupted) {
+          console.log('⚡ Response interrupted by user');
           this.onInterrupted();
           return;
         }
 
         // Handle turn complete
         if (content.turnComplete) {
+          console.log('✅ Turn complete');
           this.onTurnComplete();
           return;
         }
 
-        // Handle model turn with parts
+        // Handle input transcription (what the user said)
+        if (content.inputTranscription) {
+          const text = content.inputTranscription.text;
+          const isFinal = content.inputTranscription.isFinal || false;
+          console.log(`👤 User transcript: "${text}" (final: ${isFinal})`);
+          this.onInputTranscript(text, isFinal);
+        }
+
+        // Handle output transcription (what Gemini said)
+        if (content.outputTranscription) {
+          const text = content.outputTranscription.text;
+          const isFinal = content.outputTranscription.isFinal || false;
+          console.log(`🤖 Gemini transcript: "${text}" (final: ${isFinal})`);
+          this.onTranscript(text, isFinal);
+        }
+
+        // Handle model turn with parts (audio and text)
         if (content.modelTurn && content.modelTurn.parts) {
           for (const part of content.modelTurn.parts) {
             // Handle audio response
@@ -116,13 +192,13 @@ export class GeminiLiveClient {
               for (let i = 0; i < Math.min(10, decoded.length / 2); i++) {
                 samples.push(decoded.readInt16LE(i * 2));
               }
-              console.log(`🔊 Audio: ${part.inlineData.mimeType}, ${audioData.length} base64 chars, ${decoded.length} bytes, first samples: [${samples.join(', ')}]`);
+              console.log(`🔊 Audio: ${part.inlineData.mimeType}, ${decoded.length} bytes, samples: [${samples.slice(0, 5).join(', ')}...]`);
               this.onAudio(audioData, part.inlineData.mimeType);
             }
             
-            // Handle text response
+            // Handle text response (fallback, usually transcription handles this)
             if (part.text) {
-              console.log(`📝 Transcript: ${part.text}`);
+              console.log(`📝 Text part: ${part.text}`);
               this.onTranscript(part.text, false);
             }
           }
@@ -131,7 +207,13 @@ export class GeminiLiveClient {
 
       // Handle tool calls if needed
       if (message.toolCall) {
-        console.log('Tool call received:', message.toolCall);
+        console.log('🔧 Tool call received:', JSON.stringify(message.toolCall, null, 2));
+        // TODO: Implement tool call handling
+      }
+
+      // Handle tool call cancellation
+      if (message.toolCallCancellation) {
+        console.log('❌ Tool call cancelled:', message.toolCallCancellation);
       }
 
     } catch (error) {
@@ -176,6 +258,19 @@ export class GeminiLiveClient {
     this.send(message);
   }
 
+  // Send activity signals (for voice activity detection)
+  sendActivityStart() {
+    if (this.isConnected && this.setupComplete) {
+      this.send({ activityStart: {} });
+    }
+  }
+
+  sendActivityEnd() {
+    if (this.isConnected && this.setupComplete) {
+      this.send({ activityEnd: {} });
+    }
+  }
+
   interrupt() {
     // Send end of turn to interrupt
     if (this.isConnected && this.setupComplete) {
@@ -211,5 +306,9 @@ export class GeminiLiveClient {
     this.isConnected = false;
     this.setupComplete = false;
   }
-}
 
+  // Get session resumption token for reconnecting
+  getResumptionToken() {
+    return this.sessionResumptionToken;
+  }
+}
