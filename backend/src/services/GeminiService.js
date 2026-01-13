@@ -258,6 +258,13 @@ export class GeminiService extends EventEmitter {
     if (content.modelTurn && content.modelTurn.parts) {
       for (const part of content.modelTurn.parts) {
         if (part.inlineData && part.inlineData.mimeType?.includes('audio')) {
+          const dataLen = part.inlineData.data?.length || 0;
+          this.logger.debug({ 
+            mimeType: part.inlineData.mimeType,
+            dataLength: dataLen,
+            dataSample: part.inlineData.data?.substring(0, 50)
+          }, 'Audio chunk received from Gemini');
+          
           this.emit('audio', {
             data: part.inlineData.data,
             mimeType: part.inlineData.mimeType
