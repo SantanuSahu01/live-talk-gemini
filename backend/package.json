@@ -1,19 +1,30 @@
 {
-  "name": "live-talk-gemini-backend",
-  "version": "1.0.0",
-  "description": "Node.js backend for Gemini Live audio streaming",
+  "name": "ai-interview-backend",
+  "version": "2.0.0",
+  "description": "AI Interview Platform - Gemini Live Backend",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "dev": "node --watch src/index.js",
+    "pm2:start": "pm2 start ecosystem.config.cjs",
+    "pm2:stop": "pm2 stop ecosystem.config.cjs",
+    "pm2:restart": "pm2 restart ecosystem.config.cjs",
+    "pm2:logs": "pm2 logs ai-interview"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.490.0",
+    "amqplib": "^0.10.4",
     "dotenv": "^16.4.5",
-    "ws": "^8.16.0"
+    "pino": "^8.18.0",
+    "pino-pretty": "^10.3.1",
+    "ws": "^8.16.0",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "pm2": "^5.3.0"
   },
   "engines": {
     "node": ">=18.0.0"
   }
 }
-

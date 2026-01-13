@@ -2,12 +2,16 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 
 export function useWebSocket({
   url,
+  onSessionCreated = () => {},
   onConnected = () => {},
   onDisconnected = () => {},
-  onAudio = (data, mimeType) => {},
-  onTranscript = (text, isFinal, role) => {},
+  onAudio = () => {},
+  onTranscript = () => {},
   onTurnComplete = () => {},
   onInterrupted = () => {},
+  onCallEnded = () => {},
+  onEvaluationSubmitted = () => {},
+  onMaxDurationReached = () => {},
   onError = () => {},
   onGoAway = () => {},
   onSessionResumable = () => {}
@@ -15,6 +19,7 @@ export function useWebSocket({
   const [connectionState, setConnectionState] = useState('disconnected')
   const wsRef = useRef(null)
   const sessionTokenRef = useRef(null)
+  const sessionIdRef = useRef(null)
 
   const connect = useCallback((resumptionToken = null) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -44,6 +49,12 @@ export function useWebSocket({
           const data = JSON.parse(event.data)
           
           switch (data.type) {
+            case 'session_created':
+              console.log('📋 Session created:', data.sessionId)
+              sessionIdRef.current = data.sessionId
+              onSessionCreated(data.sessionId)
+              break
+              
             case 'connected':
               console.log('✅ Connected to Gemini')
               onConnected()
@@ -77,6 +88,21 @@ export function useWebSocket({
               onInterrupted()
               break
               
+            case 'call_ended':
+              console.log('📞 Call ended:', data.reason)
+              onCallEnded(data.reason, data.summary, data.endedBy)
+              break
+              
+            case 'evaluation_submitted':
+              console.log('📊 Evaluation submitted')
+              onEvaluationSubmitted(data.evaluation)
+              break
+              
+            case 'max_duration_reached':
+              console.log('⏱️ Max duration reached')
+              onMaxDurationReached()
+              break
+              
             case 'error':
               console.error('❌ Error:', data.message)
               onError(data.message)
@@ -94,7 +120,7 @@ export function useWebSocket({
               break
               
             default:
-              console.log('Unknown message type:', data.type)
+              console.log('Unknown message type:', data.type, data)
           }
         } catch (error) {
           console.error('Error parsing WebSocket message:', error)
@@ -116,7 +142,9 @@ export function useWebSocket({
       setConnectionState('disconnected')
       onError('Failed to connect')
     }
-  }, [url, onConnected, onDisconnected, onAudio, onTranscript, onTurnComplete, onInterrupted, onError, onGoAway, onSessionResumable])
+  }, [url, onSessionCreated, onConnected, onDisconnected, onAudio, onTranscript, 
+      onTurnComplete, onInterrupted, onCallEnded, onEvaluationSubmitted, 
+      onMaxDurationReached, onError, onGoAway, onSessionResumable])
 
   const disconnect = useCallback(() => {
     if (wsRef.current) {
@@ -152,12 +180,9 @@ export function useWebSocket({
     }
   }, [])
 
-  const sendMessage = useCallback((type, payload = {}) => {
+  const sendMessage = useCallback((message) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type,
-        ...payload
-      }))
+      wsRef.current.send(JSON.stringify(message))
     }
   }, [])
 
@@ -187,6 +212,7 @@ export function useWebSocket({
     sendMessage,
     connectionState,
     isConnected: connectionState === 'connected',
-    sessionToken: sessionTokenRef.current
+    sessionToken: sessionTokenRef.current,
+    sessionId: sessionIdRef.current
   }
 }
