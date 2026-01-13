@@ -1,139 +1,187 @@
 import { useRef, useCallback, useEffect } from 'react'
 
-// Parse sample rate from MIME type like "audio/pcm;rate=24000"
-function parseSampleRate(mimeType) {
-  if (!mimeType) return 24000
-  const match = mimeType.match(/rate=(\d+)/)
-  return match ? parseInt(match[1], 10) : 24000
-}
-
-// Convert base64 PCM (16-bit signed) to Float32 using DataView for correct byte handling
-function base64ToFloat32(base64) {
-  // Decode base64 to binary
-  const binaryString = atob(base64)
-  const bytes = new Uint8Array(binaryString.length)
-  for (let i = 0; i < binaryString.length; i++) {
-    bytes[i] = binaryString.charCodeAt(i)
-  }
-  
-  // Use DataView to read 16-bit signed integers (little-endian, which is standard for PCM)
-  const dataView = new DataView(bytes.buffer)
-  const numSamples = bytes.length / 2
-  const float32Data = new Float32Array(numSamples)
-  
-  for (let i = 0; i < numSamples; i++) {
-    // Read as signed 16-bit little-endian
-    const sample = dataView.getInt16(i * 2, true) // true = little-endian
-    // Normalize to -1.0 to 1.0
-    float32Data[i] = sample / 32768.0
-  }
-  
-  return float32Data
-}
-
-export function useAudioPlayer({ onEnded = () => {} }) {
+export function useAudioPlayer({
+  onEnded = () => {},
+  onAudioLevel = () => {},
+}) {
   const audioContextRef = useRef(null)
-  const nextPlayTimeRef = useRef(0)
+  const analyserRef = useRef(null)
+  const gainNodeRef = useRef(null)
+  const queueRef = useRef([])
   const isPlayingRef = useRef(false)
+  const nextPlayTimeRef = useRef(0)
+  const animationRef = useRef(null)
 
-  // Get or create audio context
-  const getContext = useCallback(async () => {
+  // Initialize audio context
+  const initContext = useCallback(() => {
     if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
-      const AudioContext = window.AudioContext || window.webkitAudioContext
       audioContextRef.current = new AudioContext({ sampleRate: 24000 })
-      console.log(`🎧 Created AudioContext at ${audioContextRef.current.sampleRate}Hz`)
+      
+      // Create gain node
+      gainNodeRef.current = audioContextRef.current.createGain()
+      gainNodeRef.current.connect(audioContextRef.current.destination)
+      
+      // Create analyser
+      analyserRef.current = audioContextRef.current.createAnalyser()
+      analyserRef.current.fftSize = 256
+      analyserRef.current.connect(gainNodeRef.current)
     }
     
-    // Resume if suspended (browser autoplay policy)
+    // Resume if suspended
     if (audioContextRef.current.state === 'suspended') {
-      console.log('🔄 Resuming AudioContext...')
-      await audioContextRef.current.resume()
-      console.log(`🎧 AudioContext resumed: ${audioContextRef.current.state}`)
+      audioContextRef.current.resume()
     }
     
     return audioContextRef.current
   }, [])
 
-  // Play a PCM chunk - scheduled for seamless playback
-  const playChunk = useCallback(async (base64Audio, sampleRate) => {
-    try {
-      const audioContext = await getContext()
-      
-      // Convert base64 PCM to Float32
-      const float32Data = base64ToFloat32(base64Audio)
-      
-      // Debug: check audio amplitude
-      let maxVal = 0
-      let minVal = 0
-      for (let i = 0; i < float32Data.length; i++) {
-        if (float32Data[i] > maxVal) maxVal = float32Data[i]
-        if (float32Data[i] < minVal) minVal = float32Data[i]
+  // Analyze audio level
+  const analyzeLevel = useCallback(() => {
+    if (!analyserRef.current || !isPlayingRef.current) {
+      onAudioLevel(0)
+      return
+    }
+
+    const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount)
+    analyserRef.current.getByteFrequencyData(dataArray)
+    
+    let sum = 0
+    for (let i = 0; i < dataArray.length; i++) {
+      sum += dataArray[i]
+    }
+    const average = sum / dataArray.length / 255
+
+    onAudioLevel(average)
+    
+    animationRef.current = requestAnimationFrame(analyzeLevel)
+  }, [onAudioLevel])
+
+  // Play next chunk in queue
+  const playNext = useCallback(async () => {
+    if (queueRef.current.length === 0) {
+      isPlayingRef.current = false
+      if (animationRef.current) {
+        cancelAnimationFrame(animationRef.current)
+        animationRef.current = null
       }
+      onAudioLevel(0)
+      onEnded()
+      return
+    }
+
+    const context = initContext()
+    const chunk = queueRef.current.shift()
+
+    try {
+      // Decode base64 to PCM
+      const binary = atob(chunk.data)
+      const bytes = new Uint8Array(binary.length)
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i)
+      }
+
+      // Convert 16-bit PCM to Float32
+      const samples = bytes.length / 2
+      const float32 = new Float32Array(samples)
+      const view = new DataView(bytes.buffer)
       
-      const durationMs = (float32Data.length / sampleRate * 1000).toFixed(0)
-      console.log(`🔈 Chunk: ${float32Data.length} samples, ${durationMs}ms, range: [${minVal.toFixed(4)}, ${maxVal.toFixed(4)}], ctxRate: ${audioContext.sampleRate}Hz`)
+      for (let i = 0; i < samples; i++) {
+        const sample = view.getInt16(i * 2, true) // Little-endian
+        float32[i] = sample / 32768
+      }
 
       // Create audio buffer
-      const audioBuffer = audioContext.createBuffer(1, float32Data.length, sampleRate)
-      audioBuffer.copyToChannel(float32Data, 0)
+      const audioBuffer = context.createBuffer(1, float32.length, 24000)
+      audioBuffer.copyToChannel(float32, 0)
 
       // Create source
-      const source = audioContext.createBufferSource()
+      const source = context.createBufferSource()
       source.buffer = audioBuffer
-      source.connect(audioContext.destination)
+      source.connect(analyserRef.current)
 
-      // Handle jitter - if we're behind, catch up
-      if (nextPlayTimeRef.current < audioContext.currentTime) {
-        nextPlayTimeRef.current = audioContext.currentTime
+      // Handle jitter - reset time if we're behind
+      const currentTime = context.currentTime
+      if (nextPlayTimeRef.current < currentTime) {
+        nextPlayTimeRef.current = currentTime
       }
 
       // Schedule playback
       source.start(nextPlayTimeRef.current)
-      
-      // Update next play time
       nextPlayTimeRef.current += audioBuffer.duration
-      
-      isPlayingRef.current = true
 
-      // Check when playback ends
+      // Start level analysis
+      if (!animationRef.current) {
+        analyzeLevel()
+      }
+
       source.onended = () => {
-        if (audioContext.currentTime >= nextPlayTimeRef.current - 0.01) {
-          isPlayingRef.current = false
-          onEnded()
+        if (queueRef.current.length === 0) {
+          playNext()
         }
       }
 
+      // Continue processing queue
+      if (queueRef.current.length > 0) {
+        playNext()
+      }
+
     } catch (error) {
-      console.error('❌ Error playing audio:', error)
+      console.error('Error playing audio:', error)
+      playNext()
     }
-  }, [getContext, onEnded])
+  }, [initContext, onEnded, analyzeLevel, onAudioLevel])
 
-  // Main entry point
-  const playAudio = useCallback((base64Audio, mimeType) => {
-    const sampleRate = parseSampleRate(mimeType)
-    console.log(`📥 Audio received: ${base64Audio.length} base64 chars`)
-    playChunk(base64Audio, sampleRate)
-  }, [playChunk])
+  // Add audio to queue
+  const playAudio = useCallback((base64Data, mimeType) => {
+    queueRef.current.push({ data: base64Data, mimeType })
 
+    if (!isPlayingRef.current) {
+      isPlayingRef.current = true
+      playNext()
+    }
+  }, [playNext])
+
+  // Stop playback
   const stopPlayback = useCallback(() => {
-    if (audioContextRef.current) {
-      nextPlayTimeRef.current = audioContextRef.current.currentTime
-    }
+    queueRef.current = []
+    nextPlayTimeRef.current = 0
     isPlayingRef.current = false
-    onEnded()
-  }, [onEnded])
+    
+    if (animationRef.current) {
+      cancelAnimationFrame(animationRef.current)
+      animationRef.current = null
+    }
+    
+    onAudioLevel(0)
+  }, [onAudioLevel])
+
+  // Get current audio level
+  const getAudioLevel = useCallback(() => {
+    if (!analyserRef.current) return 0
+    
+    const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount)
+    analyserRef.current.getByteFrequencyData(dataArray)
+    
+    let sum = 0
+    for (let i = 0; i < dataArray.length; i++) {
+      sum += dataArray[i]
+    }
+    return sum / dataArray.length / 255
+  }, [])
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
+      stopPlayback()
       if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
-        audioContextRef.current.close().catch(() => {})
+        audioContextRef.current.close()
       }
     }
-  }, [])
+  }, [stopPlayback])
 
   return {
     playAudio,
-    stopPlayback
+    stopPlayback,
+    getAudioLevel,
   }
 }

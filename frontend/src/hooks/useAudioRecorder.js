@@ -1,105 +1,148 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 
-export function useAudioRecorder({ onAudioData, onStarted = () => {} }) {
+export function useAudioRecorder({
+  onAudioData = () => {},
+  onStarted = () => {},
+  onStopped = () => {},
+  onAudioLevel = () => {},
+}) {
   const [isRecording, setIsRecording] = useState(false)
   const [isSupported, setIsSupported] = useState(true)
   
-  const mediaStreamRef = useRef(null)
   const audioContextRef = useRef(null)
+  const streamRef = useRef(null)
   const processorRef = useRef(null)
-  const sourceRef = useRef(null)
+  const analyserRef = useRef(null)
+  const animationRef = useRef(null)
 
   // Check browser support
   useEffect(() => {
-    const supported = !!(navigator.mediaDevices?.getUserMedia && 
-                        (window.AudioContext || window.webkitAudioContext))
-    setIsSupported(supported)
+    setIsSupported(
+      typeof navigator !== 'undefined' &&
+      navigator.mediaDevices &&
+      typeof navigator.mediaDevices.getUserMedia === 'function' &&
+      typeof AudioContext !== 'undefined'
+    )
   }, [])
 
+  // Analyze audio levels
+  const analyzeLevel = useCallback(() => {
+    if (!analyserRef.current) return
+
+    const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount)
+    analyserRef.current.getByteFrequencyData(dataArray)
+    
+    // Calculate average level
+    let sum = 0
+    for (let i = 0; i < dataArray.length; i++) {
+      sum += dataArray[i]
+    }
+    const average = sum / dataArray.length / 255
+
+    onAudioLevel(average)
+    
+    if (isRecording) {
+      animationRef.current = requestAnimationFrame(analyzeLevel)
+    }
+  }, [isRecording, onAudioLevel])
+
   const startRecording = useCallback(async () => {
+    if (!isSupported || isRecording) return
+
     try {
-      // Request microphone access
+      // Get microphone access
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
-          channelCount: 1,
           sampleRate: 16000,
+          channelCount: 1,
           echoCancellation: true,
           noiseSuppression: true,
-          autoGainControl: true
         }
       })
 
-      mediaStreamRef.current = stream
+      streamRef.current = stream
 
-      // Create audio context with 16kHz sample rate (required by Gemini)
-      const AudioContext = window.AudioContext || window.webkitAudioContext
+      // Create audio context
       audioContextRef.current = new AudioContext({ sampleRate: 16000 })
+      const source = audioContextRef.current.createMediaStreamSource(stream)
 
-      // Create source from microphone
-      sourceRef.current = audioContextRef.current.createMediaStreamSource(stream)
+      // Create analyser for level detection
+      analyserRef.current = audioContextRef.current.createAnalyser()
+      analyserRef.current.fftSize = 256
+      source.connect(analyserRef.current)
 
-      // Create script processor for raw audio access
-      // Note: ScriptProcessorNode is deprecated but AudioWorklet requires more setup
-      const bufferSize = 4096
-      processorRef.current = audioContextRef.current.createScriptProcessor(bufferSize, 1, 1)
-
+      // Create processor for audio data
+      processorRef.current = audioContextRef.current.createScriptProcessor(4096, 1, 1)
+      
       processorRef.current.onaudioprocess = (event) => {
         const inputData = event.inputBuffer.getChannelData(0)
         
-        // Convert Float32Array to Int16Array (PCM 16-bit)
+        // Convert to 16-bit PCM
         const pcmData = new Int16Array(inputData.length)
         for (let i = 0; i < inputData.length; i++) {
-          // Clamp values between -1 and 1, then scale to Int16 range
           const sample = Math.max(-1, Math.min(1, inputData[i]))
-          pcmData[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff
+          pcmData[i] = sample < 0 ? sample * 0x8000 : sample * 0x7FFF
         }
 
         // Convert to base64
-        const base64 = arrayBufferToBase64(pcmData.buffer)
+        const uint8Array = new Uint8Array(pcmData.buffer)
+        let binary = ''
+        for (let i = 0; i < uint8Array.length; i++) {
+          binary += String.fromCharCode(uint8Array[i])
+        }
+        const base64 = btoa(binary)
+
         onAudioData(base64)
       }
 
-      // Connect the audio graph
-      sourceRef.current.connect(processorRef.current)
+      source.connect(processorRef.current)
       processorRef.current.connect(audioContextRef.current.destination)
 
       setIsRecording(true)
       onStarted()
-      console.log('Recording started')
+      
+      // Start level analysis
+      analyzeLevel()
 
     } catch (error) {
       console.error('Failed to start recording:', error)
-      throw error
+      if (error.name === 'NotAllowedError') {
+        setIsSupported(false)
+      }
     }
-  }, [onAudioData, onStarted])
+  }, [isSupported, isRecording, onAudioData, onStarted, analyzeLevel])
 
   const stopRecording = useCallback(() => {
-    // Stop the media stream tracks
-    if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach(track => track.stop())
-      mediaStreamRef.current = null
+    // Stop animation
+    if (animationRef.current) {
+      cancelAnimationFrame(animationRef.current)
+      animationRef.current = null
     }
 
-    // Disconnect and clean up audio nodes
+    // Stop processor
     if (processorRef.current) {
       processorRef.current.disconnect()
       processorRef.current = null
     }
 
-    if (sourceRef.current) {
-      sourceRef.current.disconnect()
-      sourceRef.current = null
+    // Stop stream
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop())
+      streamRef.current = null
     }
 
-    // Close the audio context
-    if (audioContextRef.current) {
+    // Close audio context
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
       audioContextRef.current.close()
       audioContextRef.current = null
     }
 
+    analyserRef.current = null
+    
     setIsRecording(false)
-    console.log('Recording stopped')
-  }, [])
+    onStopped()
+    onAudioLevel(0)
+  }, [onStopped, onAudioLevel])
 
   // Cleanup on unmount
   useEffect(() => {
@@ -112,17 +155,6 @@ export function useAudioRecorder({ onAudioData, onStarted = () => {} }) {
     startRecording,
     stopRecording,
     isRecording,
-    isSupported
+    isSupported,
   }
 }
-
-// Helper function to convert ArrayBuffer to base64
-function arrayBufferToBase64(buffer) {
-  const bytes = new Uint8Array(buffer)
-  let binary = ''
-  for (let i = 0; i < bytes.byteLength; i++) {
-    binary += String.fromCharCode(bytes[i])
-  }
-  return btoa(binary)
-}
-
