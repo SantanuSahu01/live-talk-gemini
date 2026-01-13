@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { useInterview, InterviewState } from '@/context/InterviewContext'
 import { Button } from '@/components/ui/button'
@@ -35,29 +35,6 @@ export default function InterviewPage() {
       navigate(`/interview/${interviewId}/completed`)
     }
   }, [state, interviewId, navigate])
-
-  // Build display transcripts with current interim texts
-  const displayTranscripts = [...transcripts]
-  
-  if (currentUserText) {
-    displayTranscripts.push({
-      id: 'user-current',
-      role: 'user',
-      text: currentUserText,
-      isFinal: false,
-      timestamp: Date.now(),
-    })
-  }
-  
-  if (currentAssistantText) {
-    displayTranscripts.push({
-      id: 'assistant-current',
-      role: 'assistant',
-      text: currentAssistantText,
-      isFinal: false,
-      timestamp: Date.now(),
-    })
-  }
 
   return (
     <div className="flex-1 flex flex-col p-4 gap-4 max-w-7xl mx-auto w-full">
@@ -144,7 +121,7 @@ export default function InterviewPage() {
           <CardHeader className="py-3 px-4 shrink-0">
             <div className="flex items-center justify-between">
               <CardTitle className="text-sm font-medium">Conversation</CardTitle>
-              {displayTranscripts.length > 0 && (
+              {transcripts.length > 0 && (
                 <Button variant="ghost" size="sm" onClick={clearTranscripts}>
                   Clear
                 </Button>
@@ -153,8 +130,9 @@ export default function InterviewPage() {
           </CardHeader>
           <CardContent className="p-4 pt-0 flex-1 min-h-0">
             <TranscriptList 
-              transcripts={displayTranscripts}
-              isSpeaking={isSpeaking}
+              transcripts={transcripts}
+              currentUserText={currentUserText}
+              currentAssistantText={currentAssistantText}
             />
           </CardContent>
         </Card>

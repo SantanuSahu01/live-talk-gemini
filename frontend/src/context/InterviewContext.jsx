@@ -41,6 +41,7 @@ const ActionType = {
   SET_CONFIG: 'SET_CONFIG',
   ADD_TRANSCRIPT: 'ADD_TRANSCRIPT',
   UPDATE_CURRENT_TEXT: 'UPDATE_CURRENT_TEXT',
+  CLEAR_CURRENT_TEXT: 'CLEAR_CURRENT_TEXT',
   SET_SPEAKING: 'SET_SPEAKING',
   SET_RECORDING: 'SET_RECORDING',
   SET_USER_AUDIO_LEVEL: 'SET_USER_AUDIO_LEVEL',
@@ -67,23 +68,30 @@ function interviewReducer(state, action) {
       return { ...state, config: action.payload }
     
     case ActionType.ADD_TRANSCRIPT:
-      const { role, text, isFinal, id } = action.payload
-      if (isFinal) {
-        const filtered = state.transcripts.filter(t => t.id !== `${role}-current`)
-        return {
-          ...state,
-          transcripts: [...filtered, { id, role, text, isFinal, timestamp: Date.now() }],
-          currentUserText: role === 'user' ? '' : state.currentUserText,
-          currentAssistantText: role === 'assistant' ? '' : state.currentAssistantText,
-        }
+      const { role, text, id } = action.payload
+      if (!text || !text.trim()) return state
+      console.log('[Context] Adding to history:', role, text.substring(0, 50))
+      return {
+        ...state,
+        transcripts: [...state.transcripts, { id, role, text: text.trim(), timestamp: Date.now() }],
       }
-      return state
     
     case ActionType.UPDATE_CURRENT_TEXT:
+      console.log('[Context] Update current:', action.payload.role, action.payload.text?.substring(0, 50))
       if (action.payload.role === 'user') {
         return { ...state, currentUserText: action.payload.text }
       }
       return { ...state, currentAssistantText: action.payload.text }
+    
+    case ActionType.CLEAR_CURRENT_TEXT:
+      console.log('[Context] Clear current:', action.payload)
+      if (action.payload === 'user') {
+        return { ...state, currentUserText: '' }
+      }
+      if (action.payload === 'assistant') {
+        return { ...state, currentAssistantText: '' }
+      }
+      return { ...state, currentUserText: '', currentAssistantText: '' }
     
     case ActionType.SET_SPEAKING:
       return { ...state, isSpeaking: action.payload }
@@ -137,15 +145,21 @@ export function InterviewProvider({ children }) {
   const navigate = useNavigate()
   const [state, dispatch] = useReducer(interviewReducer, initialState)
   const isConnectedRef = useRef(false)
-  const accumulatedAssistantTextRef = useRef('')
   const stateRef = useRef(state.state)
+  
+  // Text accumulation refs
+  const accumulatedUserTextRef = useRef('')
+  const accumulatedAssistantTextRef = useRef('')
+  
+  // Timer refs for delayed move to history
+  const userFinalTimerRef = useRef(null)
+  const assistantFinalTimerRef = useRef(null)
 
-  // Keep stateRef updated
   useEffect(() => {
     stateRef.current = state.state
   }, [state.state])
 
-  // Stable callback refs
+  // Audio level handlers
   const handleAssistantAudioLevel = useCallback((level) => {
     dispatch({ type: ActionType.SET_ASSISTANT_AUDIO_LEVEL, payload: level })
   }, [])
@@ -164,10 +178,85 @@ export function InterviewProvider({ children }) {
     onAudioLevel: handleAssistantAudioLevel,
   })
 
-  // Audio recorder ref
   const audioRecorderRef = useRef(null)
 
-  // Stable WebSocket callbacks
+  // Handle transcript messages
+  const handleTranscript = useCallback((text, isFinal, role) => {
+    console.log('[handleTranscript]', role, isFinal ? 'FINAL' : 'interim', `"${text?.substring(0, 60)}"`)
+    
+    if (role === 'user') {
+      // Clear pending timer if new text arrives
+      if (userFinalTimerRef.current) {
+        clearTimeout(userFinalTimerRef.current)
+        userFinalTimerRef.current = null
+      }
+      
+      if (isFinal) {
+        // Show final text in live area
+        accumulatedUserTextRef.current = text
+        dispatch({
+          type: ActionType.UPDATE_CURRENT_TEXT,
+          payload: { role: 'user', text },
+        })
+        
+        // After 2 seconds, move to history
+        userFinalTimerRef.current = setTimeout(() => {
+          const finalText = accumulatedUserTextRef.current
+          if (finalText && finalText.trim()) {
+            dispatch({
+              type: ActionType.ADD_TRANSCRIPT,
+              payload: { id: `user-${Date.now()}`, role: 'user', text: finalText },
+            })
+          }
+          dispatch({ type: ActionType.CLEAR_CURRENT_TEXT, payload: 'user' })
+          accumulatedUserTextRef.current = ''
+        }, 2000)
+      } else {
+        // Update live text with interim
+        accumulatedUserTextRef.current = text
+        dispatch({
+          type: ActionType.UPDATE_CURRENT_TEXT,
+          payload: { role: 'user', text },
+        })
+      }
+    } else {
+      // Assistant transcript
+      if (assistantFinalTimerRef.current) {
+        clearTimeout(assistantFinalTimerRef.current)
+        assistantFinalTimerRef.current = null
+      }
+      
+      if (isFinal) {
+        // For assistant, use accumulated text (Gemini sends incremental chunks)
+        const finalText = accumulatedAssistantTextRef.current || text
+        dispatch({
+          type: ActionType.UPDATE_CURRENT_TEXT,
+          payload: { role: 'assistant', text: finalText },
+        })
+        
+        // After 2 seconds, move to history
+        assistantFinalTimerRef.current = setTimeout(() => {
+          if (finalText && finalText.trim()) {
+            dispatch({
+              type: ActionType.ADD_TRANSCRIPT,
+              payload: { id: `assistant-${Date.now()}`, role: 'assistant', text: finalText },
+            })
+          }
+          dispatch({ type: ActionType.CLEAR_CURRENT_TEXT, payload: 'assistant' })
+          accumulatedAssistantTextRef.current = ''
+        }, 2000)
+      } else {
+        // Accumulate interim text (Gemini sends word by word)
+        accumulatedAssistantTextRef.current += text
+        dispatch({
+          type: ActionType.UPDATE_CURRENT_TEXT,
+          payload: { role: 'assistant', text: accumulatedAssistantTextRef.current },
+        })
+      }
+    }
+  }, [])
+
+  // WebSocket callbacks
   const wsCallbacks = useMemo(() => ({
     onSessionCreated: (sessionId) => {
       dispatch({ type: ActionType.SET_SESSION, payload: sessionId })
@@ -200,40 +289,17 @@ export function InterviewProvider({ children }) {
       playAudio(data, mimeType)
     },
     
-    onTranscript: (text, isFinal, role) => {
-      if (isFinal) {
-        dispatch({
-          type: ActionType.ADD_TRANSCRIPT,
-          payload: { id: `${role}-${Date.now()}`, role, text, isFinal },
-        })
-        if (role === 'assistant') {
-          accumulatedAssistantTextRef.current = ''
-        }
-      } else {
-        if (role === 'assistant') {
-          accumulatedAssistantTextRef.current += text
-          dispatch({
-            type: ActionType.UPDATE_CURRENT_TEXT,
-            payload: { role, text: accumulatedAssistantTextRef.current },
-          })
-        } else {
-          dispatch({
-            type: ActionType.UPDATE_CURRENT_TEXT,
-            payload: { role, text },
-          })
-        }
-      }
-    },
+    onTranscript: handleTranscript,
     
     onTurnComplete: () => {
-      dispatch({ type: ActionType.SET_SPEAKING, payload: false })
-      accumulatedAssistantTextRef.current = ''
+      // Don't set speaking to false - wait for audio to finish
     },
     
     onInterrupted: () => {
       dispatch({ type: ActionType.SET_SPEAKING, payload: false })
       stopPlayback()
       accumulatedAssistantTextRef.current = ''
+      dispatch({ type: ActionType.CLEAR_CURRENT_TEXT, payload: 'assistant' })
     },
     
     onCallEnded: (reason, summary) => {
@@ -264,7 +330,7 @@ export function InterviewProvider({ children }) {
     onSessionResumable: (token) => {
       dispatch({ type: ActionType.SET_RESUMPTION_TOKEN, payload: token })
     },
-  }), [playAudio, stopPlayback])
+  }), [playAudio, stopPlayback, handleTranscript])
 
   // WebSocket
   const {
@@ -278,7 +344,7 @@ export function InterviewProvider({ children }) {
     ...wsCallbacks,
   })
 
-  // Stable recorder callbacks
+  // Recorder callbacks
   const handleAudioData = useCallback((base64Audio) => {
     if (isConnectedRef.current) {
       sendAudio(base64Audio)
@@ -301,7 +367,6 @@ export function InterviewProvider({ children }) {
     onAudioLevel: handleUserAudioLevel,
   })
 
-  // Store recorder methods in ref for WebSocket callbacks
   useEffect(() => {
     audioRecorderRef.current = { startRecording, stopRecording }
   }, [startRecording, stopRecording])
@@ -313,7 +378,6 @@ export function InterviewProvider({ children }) {
     
     connect()
     
-    // Send config after brief delay
     setTimeout(() => {
       sendMessage({
         type: 'config',
@@ -349,9 +413,11 @@ export function InterviewProvider({ children }) {
     dispatch({ type: ActionType.CLEAR_TRANSCRIPTS })
   }, [])
 
-  // Cleanup on unmount
+  // Cleanup
   useEffect(() => {
     return () => {
+      if (userFinalTimerRef.current) clearTimeout(userFinalTimerRef.current)
+      if (assistantFinalTimerRef.current) clearTimeout(assistantFinalTimerRef.current)
       disconnect()
       stopRecording()
       stopPlayback()
@@ -362,8 +428,6 @@ export function InterviewProvider({ children }) {
     ...state,
     interviewId,
     isAudioSupported: isSupported,
-    
-    // Actions
     startInterview,
     endInterview,
     interrupt,
