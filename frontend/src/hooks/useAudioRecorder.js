@@ -14,6 +14,19 @@ export function useAudioRecorder({
   const processorRef = useRef(null)
   const analyserRef = useRef(null)
   const animationRef = useRef(null)
+  
+  // Keep callback refs stable
+  const onAudioDataRef = useRef(onAudioData)
+  const onStartedRef = useRef(onStarted)
+  const onStoppedRef = useRef(onStopped)
+  const onAudioLevelRef = useRef(onAudioLevel)
+
+  useEffect(() => {
+    onAudioDataRef.current = onAudioData
+    onStartedRef.current = onStarted
+    onStoppedRef.current = onStopped
+    onAudioLevelRef.current = onAudioLevel
+  }, [onAudioData, onStarted, onStopped, onAudioLevel])
 
   // Check browser support
   useEffect(() => {
@@ -39,12 +52,10 @@ export function useAudioRecorder({
     }
     const average = sum / dataArray.length / 255
 
-    onAudioLevel(average)
+    onAudioLevelRef.current(average)
     
-    if (isRecording) {
-      animationRef.current = requestAnimationFrame(analyzeLevel)
-    }
-  }, [isRecording, onAudioLevel])
+    animationRef.current = requestAnimationFrame(analyzeLevel)
+  }, [])
 
   const startRecording = useCallback(async () => {
     if (!isSupported || isRecording) return
@@ -92,14 +103,14 @@ export function useAudioRecorder({
         }
         const base64 = btoa(binary)
 
-        onAudioData(base64)
+        onAudioDataRef.current(base64)
       }
 
       source.connect(processorRef.current)
       processorRef.current.connect(audioContextRef.current.destination)
 
       setIsRecording(true)
-      onStarted()
+      onStartedRef.current()
       
       // Start level analysis
       analyzeLevel()
@@ -110,7 +121,7 @@ export function useAudioRecorder({
         setIsSupported(false)
       }
     }
-  }, [isSupported, isRecording, onAudioData, onStarted, analyzeLevel])
+  }, [isSupported, isRecording, analyzeLevel])
 
   const stopRecording = useCallback(() => {
     // Stop animation
@@ -140,16 +151,23 @@ export function useAudioRecorder({
     analyserRef.current = null
     
     setIsRecording(false)
-    onStopped()
-    onAudioLevel(0)
-  }, [onStopped, onAudioLevel])
+    onStoppedRef.current()
+  }, [])
 
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      stopRecording()
+      if (animationRef.current) {
+        cancelAnimationFrame(animationRef.current)
+      }
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop())
+      }
+      if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+        audioContextRef.current.close()
+      }
     }
-  }, [stopRecording])
+  }, [])
 
   return {
     startRecording,

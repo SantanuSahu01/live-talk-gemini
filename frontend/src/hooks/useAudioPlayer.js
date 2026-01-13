@@ -11,6 +11,14 @@ export function useAudioPlayer({
   const isPlayingRef = useRef(false)
   const nextPlayTimeRef = useRef(0)
   const animationRef = useRef(null)
+  const onAudioLevelRef = useRef(onAudioLevel)
+  const onEndedRef = useRef(onEnded)
+
+  // Keep refs updated
+  useEffect(() => {
+    onAudioLevelRef.current = onAudioLevel
+    onEndedRef.current = onEnded
+  }, [onAudioLevel, onEnded])
 
   // Initialize audio context
   const initContext = useCallback(() => {
@@ -38,7 +46,6 @@ export function useAudioPlayer({
   // Analyze audio level
   const analyzeLevel = useCallback(() => {
     if (!analyserRef.current || !isPlayingRef.current) {
-      onAudioLevel(0)
       return
     }
 
@@ -51,10 +58,10 @@ export function useAudioPlayer({
     }
     const average = sum / dataArray.length / 255
 
-    onAudioLevel(average)
+    onAudioLevelRef.current(average)
     
     animationRef.current = requestAnimationFrame(analyzeLevel)
-  }, [onAudioLevel])
+  }, [])
 
   // Play next chunk in queue
   const playNext = useCallback(async () => {
@@ -64,8 +71,7 @@ export function useAudioPlayer({
         cancelAnimationFrame(animationRef.current)
         animationRef.current = null
       }
-      onAudioLevel(0)
-      onEnded()
+      onEndedRef.current()
       return
     }
 
@@ -129,7 +135,7 @@ export function useAudioPlayer({
       console.error('Error playing audio:', error)
       playNext()
     }
-  }, [initContext, onEnded, analyzeLevel, onAudioLevel])
+  }, [initContext, analyzeLevel])
 
   // Add audio to queue
   const playAudio = useCallback((base64Data, mimeType) => {
@@ -151,9 +157,7 @@ export function useAudioPlayer({
       cancelAnimationFrame(animationRef.current)
       animationRef.current = null
     }
-    
-    onAudioLevel(0)
-  }, [onAudioLevel])
+  }, [])
 
   // Get current audio level
   const getAudioLevel = useCallback(() => {
@@ -172,12 +176,14 @@ export function useAudioPlayer({
   // Cleanup on unmount
   useEffect(() => {
     return () => {
-      stopPlayback()
+      if (animationRef.current) {
+        cancelAnimationFrame(animationRef.current)
+      }
       if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
         audioContextRef.current.close()
       }
     }
-  }, [stopPlayback])
+  }, [])
 
   return {
     playAudio,

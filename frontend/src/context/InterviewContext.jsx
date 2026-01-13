@@ -1,4 +1,4 @@
-import { createContext, useContext, useReducer, useCallback, useRef, useEffect } from 'react'
+import { createContext, useContext, useReducer, useCallback, useRef, useEffect, useMemo } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useWebSocket } from '@/hooks/useWebSocket'
 import { useAudioRecorder } from '@/hooks/useAudioRecorder'
@@ -43,7 +43,8 @@ const ActionType = {
   UPDATE_CURRENT_TEXT: 'UPDATE_CURRENT_TEXT',
   SET_SPEAKING: 'SET_SPEAKING',
   SET_RECORDING: 'SET_RECORDING',
-  SET_AUDIO_LEVEL: 'SET_AUDIO_LEVEL',
+  SET_USER_AUDIO_LEVEL: 'SET_USER_AUDIO_LEVEL',
+  SET_ASSISTANT_AUDIO_LEVEL: 'SET_ASSISTANT_AUDIO_LEVEL',
   SET_ERROR: 'SET_ERROR',
   SET_END_DATA: 'SET_END_DATA',
   SET_EVALUATION: 'SET_EVALUATION',
@@ -68,7 +69,6 @@ function interviewReducer(state, action) {
     case ActionType.ADD_TRANSCRIPT:
       const { role, text, isFinal, id } = action.payload
       if (isFinal) {
-        // Remove interim and add final
         const filtered = state.transcripts.filter(t => t.id !== `${role}-current`)
         return {
           ...state,
@@ -91,11 +91,11 @@ function interviewReducer(state, action) {
     case ActionType.SET_RECORDING:
       return { ...state, isRecording: action.payload }
     
-    case ActionType.SET_AUDIO_LEVEL:
-      if (action.payload.type === 'user') {
-        return { ...state, userAudioLevel: action.payload.level }
-      }
-      return { ...state, assistantAudioLevel: action.payload.level }
+    case ActionType.SET_USER_AUDIO_LEVEL:
+      return { ...state, userAudioLevel: action.payload }
+    
+    case ActionType.SET_ASSISTANT_AUDIO_LEVEL:
+      return { ...state, assistantAudioLevel: action.payload }
     
     case ActionType.SET_ERROR:
       return { ...state, state: InterviewState.ERROR, error: action.payload }
@@ -138,29 +138,37 @@ export function InterviewProvider({ children }) {
   const [state, dispatch] = useReducer(interviewReducer, initialState)
   const isConnectedRef = useRef(false)
   const accumulatedAssistantTextRef = useRef('')
+  const stateRef = useRef(state.state)
+
+  // Keep stateRef updated
+  useEffect(() => {
+    stateRef.current = state.state
+  }, [state.state])
+
+  // Stable callback refs
+  const handleAssistantAudioLevel = useCallback((level) => {
+    dispatch({ type: ActionType.SET_ASSISTANT_AUDIO_LEVEL, payload: level })
+  }, [])
+
+  const handleUserAudioLevel = useCallback((level) => {
+    dispatch({ type: ActionType.SET_USER_AUDIO_LEVEL, payload: level })
+  }, [])
+
+  const handlePlaybackEnded = useCallback(() => {
+    dispatch({ type: ActionType.SET_SPEAKING, payload: false })
+  }, [])
 
   // Audio player
   const { playAudio, stopPlayback } = useAudioPlayer({
-    onEnded: () => dispatch({ type: ActionType.SET_SPEAKING, payload: false }),
-    onAudioLevel: (level) => dispatch({ 
-      type: ActionType.SET_AUDIO_LEVEL, 
-      payload: { type: 'assistant', level } 
-    }),
+    onEnded: handlePlaybackEnded,
+    onAudioLevel: handleAssistantAudioLevel,
   })
 
   // Audio recorder ref
   const audioRecorderRef = useRef(null)
 
-  // WebSocket
-  const {
-    connect,
-    disconnect,
-    sendAudio,
-    sendMessage,
-    sendInterrupt,
-  } = useWebSocket({
-    url: `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`,
-    
+  // Stable WebSocket callbacks
+  const wsCallbacks = useMemo(() => ({
     onSessionCreated: (sessionId) => {
       dispatch({ type: ActionType.SET_SESSION, payload: sessionId })
     },
@@ -182,7 +190,7 @@ export function InterviewProvider({ children }) {
       if (token) {
         dispatch({ type: ActionType.SET_RESUMPTION_TOKEN, payload: token })
       }
-      if (state.state === InterviewState.ACTIVE) {
+      if (stateRef.current === InterviewState.ACTIVE) {
         dispatch({ type: ActionType.SET_STATE, payload: InterviewState.IDLE })
       }
     },
@@ -234,7 +242,6 @@ export function InterviewProvider({ children }) {
         audioRecorderRef.current.stopRecording()
       }
       stopPlayback()
-      navigate(`/interview/${interviewId}/completed`)
     },
     
     onEvaluationSubmitted: (evaluation) => {
@@ -243,7 +250,6 @@ export function InterviewProvider({ children }) {
     
     onMaxDurationReached: () => {
       dispatch({ type: ActionType.SET_END_DATA, payload: { reason: 'time_limit', summary: 'Interview time limit reached.' } })
-      navigate(`/interview/${interviewId}/completed`)
     },
     
     onError: (message) => {
@@ -258,24 +264,41 @@ export function InterviewProvider({ children }) {
     onSessionResumable: (token) => {
       dispatch({ type: ActionType.SET_RESUMPTION_TOKEN, payload: token })
     },
+  }), [playAudio, stopPlayback])
+
+  // WebSocket
+  const {
+    connect,
+    disconnect,
+    sendAudio,
+    sendMessage,
+    sendInterrupt,
+  } = useWebSocket({
+    url: `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`,
+    ...wsCallbacks,
   })
+
+  // Stable recorder callbacks
+  const handleAudioData = useCallback((base64Audio) => {
+    if (isConnectedRef.current) {
+      sendAudio(base64Audio)
+    }
+  }, [sendAudio])
+
+  const handleRecordingStarted = useCallback(() => {
+    dispatch({ type: ActionType.SET_RECORDING, payload: true })
+  }, [])
+
+  const handleRecordingStopped = useCallback(() => {
+    dispatch({ type: ActionType.SET_RECORDING, payload: false })
+  }, [])
 
   // Audio recorder
   const { startRecording, stopRecording, isSupported } = useAudioRecorder({
-    onAudioData: (base64Audio) => {
-      if (isConnectedRef.current) {
-        sendAudio(base64Audio)
-      }
-    },
-    onStarted: () => {
-      dispatch({ type: ActionType.SET_RECORDING, payload: true })
-    },
-    onStopped: () => {
-      dispatch({ type: ActionType.SET_RECORDING, payload: false })
-    },
-    onAudioLevel: (level) => {
-      dispatch({ type: ActionType.SET_AUDIO_LEVEL, payload: { type: 'user', level } })
-    },
+    onAudioData: handleAudioData,
+    onStarted: handleRecordingStarted,
+    onStopped: handleRecordingStopped,
+    onAudioLevel: handleUserAudioLevel,
   })
 
   // Store recorder methods in ref for WebSocket callbacks
@@ -333,9 +356,9 @@ export function InterviewProvider({ children }) {
       stopRecording()
       stopPlayback()
     }
-  }, [])
+  }, [disconnect, stopRecording, stopPlayback])
 
-  const value = {
+  const value = useMemo(() => ({
     ...state,
     interviewId,
     isAudioSupported: isSupported,
@@ -345,7 +368,7 @@ export function InterviewProvider({ children }) {
     endInterview,
     interrupt,
     clearTranscripts,
-  }
+  }), [state, interviewId, isSupported, startInterview, endInterview, interrupt, clearTranscripts])
 
   return (
     <InterviewContext.Provider value={value}>
