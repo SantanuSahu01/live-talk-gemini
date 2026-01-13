@@ -9,7 +9,7 @@ const logger = createServiceLogger('queue');
 /**
  * Routing keys for different event types
  */
-export const RoutingKeys = {
+const RoutingKeys = {
   INTERVIEW_STARTED: 'interview.started',
   INTERVIEW_ENDED: 'interview.ended',
   EVALUATION_SUBMITTED: 'interview.evaluation.submitted',
